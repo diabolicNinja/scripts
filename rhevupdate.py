@@ -148,8 +148,6 @@ except Exception as e:
 try:
     # get datacenter list
     datacenters = api.datacenters.list()
-    for dc in datacenters:
-        _datacenters.append(dc.name.upper())
 
     # "list" action
     if _action == 0:
@@ -166,28 +164,62 @@ try:
 
     # "update" action
     elif _action == 1:
-        for datacenter in datacenters:
-            print(" %15s: %20s  %15s" % ("datacenter", (datacenter.name).upper(), datacenter.status.state ))
+        print
+        print(" Available datacenters:")
+        for i in range(0, len(datacenters)):
+            counter = i + 1
+            print(" %1s. %s" % (counter, datacenters[i].name))
         print("")
-        userinput = raw_input('Select datacenters to update (space separated, "all" to update everything): ')
-        dcs = userinput.split()
-        if not dcs:
-            print("error: no input - exiting")
-            sys.exit(0)
-        elif dcs[0].lower() != "all":
-            for dc in [(d.strip()) for d in dcs]:
-                if dc.upper() not in _datacenters:
-                    print("error: " + dc + " is not valid datacenter name or not exists - skipping")
-                    dcs.remove(dc)
-        else:
-            dcs = _datacenters
-            print("going to update all datacenters")
 
-        for d in dcs:
-            print(d)
+        # user's input
+        userinput = raw_input(' Select (space separated or "all" for everything): ')
+        selected = userinput.split()
+        if not selected:
+            print(" [error]: no input - exiting")
+            sys.exit(0)
+        for item in selected:
+            item = item.strip().lower()
+            if item != "all":
+                if item.isdigit() and 0 <= (int(item) - 1) < len(datacenters):
+                    _datacenters.append(datacenters[(int(item) - 1)].name)
+                else:
+                    print(" [warning]: " + item + " not valid selection - skipping")
+            else:
+                print("going to update all datacenters")
+                for dc in datacenters:
+                    _datacenters.append(dc.name)
+        
+        print
+        print(" Selected:")
+        for dc in _datacenters:
+            print(" - " + dc)
+        while True:
+            userinput = raw_input(' Proceed (y/n): ')
+            userinput = userinput.strip().lower()
+            if userinput not in ["y","n"]:
+                continue
+            elif userinput == "n":
+                print(" Action canceled - exiting")
+                sys.exit(0)
+            else:
+                # finally starting updates
+                break
+
+        # update itself
+        print
+        for datacenter in _datacenters:
+            print(" Updating " + datacenter + ":")
+            datacenter = api.datacenters.get(datacenter)
+            print(" %15s: %20s" % ("status", datacenter.status.state ))
+            for cluster in datacenter.clusters.list():
+                print(" %15s: %20s" % ("cluster", cluster.name) )
+                hosts = api.hosts.list(query = 'cluster=' + cluster.name)
+                for host in hosts:
+                    print(" %15s: %20s  %15s  %10s  %40s  %25s  %25s" % ("host", host.name, host.status.state, host.summary.active, host.os.get_type() + " " + host.os.version.get_full_version(), host.version.get_full_version(), host.libvirt_version.get_full_version()) )
+                print
 
 except Exception as e:
-    log.debug(str(e))
+    log.debug("[error]: [line " + format(sys.exc_info()[-1].tb_lineno) + "] " + str(e) )
     sys.exit(4)
 finally:
     api.disconnect()
