@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 # vim: tabstop=8 expandtab shiftwidth=4 softtabstop=4
-############################################################
+############################################################################################
 #   Author:	    Denis Prezhevalsky (deniska@redhat.com)
 #   Date:           25 July 2015
 #   Version:        1.0
 #   Description:    python script to update RHEV 3.5
 #                   hypervisors
 #   Ref:            https://access.redhat.com/documentation/en-US/Red_Hat_Enterprise_Virtualization/3.5/index.html
-############################################################ 
+############################################################################################
+
 import paramiko
 import getpass
 import socket
@@ -18,6 +19,7 @@ import ConfigParser
 import string
 import base64
 import logging as log
+import time
 from ovirtsdk.api import API
 from ovirtsdk.xml import params
 
@@ -25,7 +27,10 @@ from ovirtsdk.xml import params
 #import libvirt
 #import yum
 
-# variables
+############################################################################################
+# Variables
+############################################################################################
+
 _version        = 1.0
 _base_filename  = os.path.splitext(__file__)[0]
 _engine_addr    = None
@@ -33,9 +38,49 @@ _engine_user    = None
 _engine_pass    = None
 _engine_cacert  = None
 _conn_string    = None
-_api_url        = None
+_else_api_url   = None
 _ca_url         = None
 _datacenters    = []
+
+############################################################################################
+# Functions
+############################################################################################
+
+def host_bulkupdate(**hostdlist):
+    # sort hosts by number of active vms (ascending)
+    hosts = sorted(hostdlist, key=lambda i: int(hostdlist[i]))
+    for host in hosts:
+        print(host + ": " + str(hostdlist[host]) )
+        log.debug("switching " + host + " into maintenance mode initiated")
+        if host_maintenance_on(host):
+            log.debug("switching " + host + " into maintenance mode completed")
+        else:
+            log.debug("switching " + host + " into maintenance mode failed - skipping")
+        return
+    #for key, value in hostdlist.iteritems():
+    #    print(key + ": " + str(value) )
+
+def host_maintenance_on(hostname):
+    host = api.hosts.get(name = hostname)
+    if host.status.state == "up":
+        host.deactivate()
+        while api.hosts.get(name = hostname).status.state != "maintenance":
+            # may take awhile to complete - think to implement timeout
+            time.sleep(1)
+    elif host.status.state == "maintenance":
+        log.debug(hostname + " is already in maintenance mode")
+    elif host.status.state == "preparing_for_maintenance":
+        log.debug(hostname + " is in middle of switching to maintenance mode")
+        while api.hosts.get(name = hostname).status.state != "maintenance":
+            time.sleep(1)
+    else:
+        log.debug(hostname + " is in invalide state: " + host.status.state)
+        return False
+    return True
+
+############################################################################################
+# Main
+###########################################################################################
 
 # logging (INFO/DEBUG)
 log.basicConfig(level=log.DEBUG,
@@ -212,11 +257,16 @@ try:
             datacenter = api.datacenters.get(datacenter)
             print(" %15s: %20s" % ("status", datacenter.status.state ))
             for cluster in datacenter.clusters.list():
+                hosts2update = {}
                 print(" %15s: %20s" % ("cluster", cluster.name) )
                 hosts = api.hosts.list(query = 'cluster=' + cluster.name)
                 for host in hosts:
-                    print(" %15s: %20s  %15s  %10s  %40s  %25s  %25s" % ("host", host.name, host.status.state, host.summary.active, host.os.get_type() + " " + host.os.version.get_full_version(), host.version.get_full_version(), host.libvirt_version.get_full_version()) )
+                    #print(" %15s: %20s  %15s  %10s  %40s  %25s  %25s" % ("host", host.name, host.status.state, host.summary.active, host.os.get_type() + " " + host.os.version.get_full_version(), host.version.get_full_version(), host.libvirt_version.get_full_version()) )
+                    # perhaps, check type for (rhev-h or rhel)
+                    #if host.status.state.lower() == "up":
+                    hosts2update[host.name] = host.summary.active
                 print
+            host_bulkupdate(**hosts2update)
 
 except Exception as e:
     log.debug("[error]: [line " + format(sys.exc_info()[-1].tb_lineno) + "] " + str(e) )
