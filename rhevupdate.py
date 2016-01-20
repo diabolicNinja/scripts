@@ -37,6 +37,8 @@ _engine_addr    = None
 _engine_user    = None
 _engine_pass    = None
 _engine_cacert  = None
+_host_user      = None
+_host_pass      = None
 _conn_string    = None
 _else_api_url   = None
 _ca_url         = None
@@ -54,6 +56,7 @@ def host_bulkupdate(**hostdlist):
         log.debug("switching " + host + " into maintenance mode initiated")
         if host_maintenance_on(host):
             log.debug("switching " + host + " into maintenance mode completed")
+            update(host)
         else:
             log.debug("switching " + host + " into maintenance mode failed - skipping")
         return
@@ -78,6 +81,70 @@ def host_maintenance_on(hostname):
         return False
     return True
 
+def update(hostname):
+    address = api.hosts.get(name = hostname).address
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        try:
+            log.debug("connecting to " + address + " via ssh");
+            ssh.connect(address, username=_host_user, password=_host_pass, timeout=10)
+
+            # yum clean all
+            stdin, stdout, stderr = ssh.exec_command("yum clean all")
+            stdin.close()
+            retcode = stdout.channel.recv_exit_status()
+            if retcode == 0:
+                log.debug(hostname + ": cleaning yum cache succeded")
+            else:
+                log.debug(hostname + ": cleaning yum cache failed")
+
+            # yum check-update
+            stdin, stdout, stderr = ssh.exec_command("yum check-update")
+            stdin.close()
+            retcode = stdout.channel.recv_exit_status()
+            ## 100 - there are available packages
+            if retcode == 100:
+                log.debug(hostname + ": updates are available")
+            ## 0 - no available updates
+            elif retcode == 0:
+                log.debug(hostname + ": no updates found - skipping")
+                return False
+            ## 1 - error
+            elif retcode == 1:
+                log.debug(hostname + ": [error] checking for updates failed on ")
+                for line in stderr.read().splitlines():
+                    log.debug(hostname + " [error]: " + line)
+                return False
+            ## unknown 
+            else:
+                log.debug(hostname + ": unknown output while checking for updates - skipping")
+                return False
+
+            # yum update
+            log.debug(hostname + ": yum update initiated")
+            stdin, stdout, stderr = ssh.exec_command("yum update -y")
+            stdin.close()
+            retcode = stdout.channel.recv_exit_status()
+            for line in stdout.read().splitlines():
+                log.debug(hostname + ": " + line)
+            if retcode != 0:
+                log.debug(hostname + ": yum update failed [exit code: " + str(retcode) + "]")
+                for line in stderr.read().splitlines():
+                    log.debug(hostname + " [error]: " + line)
+            else:
+                log.debug(hostname + ": yum update completed successfully ")
+
+            # reboot
+        except socket.error, (errnum, errmsg):
+            log.debug("failed to connect: " + errmsg + " [" + errnum + "]")
+            sys.exit(10)
+        except paramiko.AuthenticationException:
+            log.debug("failed to connect: authentication failed")
+            sys.exit(11)
+    finally:
+        ssh.close()
+
 ############################################################################################
 # Main
 ###########################################################################################
@@ -101,13 +168,21 @@ if len(fs) != 0:
             for var in config.options(section):
                 if var == 'hostname':
                     _engine_addr = config.get(section, var)
-                elif  var == 'username':
+                elif var == 'username':
                     _engine_user = config.get(section, var)
-                elif  var == 'password':
+                elif var == 'password':
                     _engine_pass = config.get(section, var)
                     _engine_pass = base64.b64decode(_engine_pass);
                 elif var == 'cacertpath':
                     _engine_cacert = config.get(section, var)
+        if string.lower(section) == 'host':
+            for var in config.options(section):
+                if var == 'username':
+                    _host_user = config.get(section, var)
+                elif var == 'password':
+                    _host_pass = config.get(section, var)
+                    _host_pass = base64.b64decode(_host_pass);
+
 
 # command line args
 log.debug("parsing command line arguments");
@@ -275,29 +350,7 @@ finally:
     api.disconnect()
     log.debug("connection closed")
 
-# temp exit point
-sys.exit(0)
-
-
-## update os
-ssh = paramiko.SSHClient()
-ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-try:
-    try:
-        ssh.connect(hostn, username='root', password=passw, timeout=10)
-        stdin, stdout, stderr = ssh.exec_command("yum clean all")
-        stdin.close()
-        for line in stdout.read().splitlines():
-            print line
-    except socket.error, (errnum, errmsg):
-        print "Connection error occured: ", errmsg, " [", errnum, "]"
-        sys.exit(10)
-    except paramiko.AuthenticationException:
-        print "Error: authentication failed"
-        sys.exit(11)
-finally:
-    ssh.close()
-
 # finish
 log.debug("end reached - exiting")
+
 sys.exit(0)
