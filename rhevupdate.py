@@ -4,9 +4,13 @@
 #   Author:	    Denis Prezhevalsky (deniska@redhat.com)
 #   Date:           25 July 2015
 #   Version:        1.0
-#   Description:    python script to update RHEV 3.5
-#                   hypervisors
+#   Description:    - python script to update RHEV 3.5 / 3.6 hypervisors
+#                   - will update ONLY active hypervisors
 #   Ref:            https://access.redhat.com/documentation/en-US/Red_Hat_Enterprise_Virtualization/3.5/index.html
+#                   https://access.redhat.com/documentation/en-US/Red_Hat_Enterprise_Virtualization/3.6-Beta/html/REST_API_Guide/index.html
+#                   https://access.redhat.com/documentation/en/red-hat-enterprise-virtualization/
+#   Known issues:   - remote ssh session can be stuck if yum already running on remote host
+#                   - when connection/vpn failed after api connection initiated - timeout wont work
 ############################################################################################
 
 import paramiko
@@ -39,9 +43,12 @@ _engine_pass    = None
 _engine_cacert  = None
 _host_user      = None
 _host_pass      = None
+_wait_timeout   = 60    # in seconds
+_ssh_timeout    = 5     # in seconds
 _conn_string    = None
 _else_api_url   = None
 _ca_url         = None
+_loglevel       = "info"
 _datacenters    = []
 
 ############################################################################################
@@ -52,52 +59,151 @@ def host_bulkupdate(**hostdlist):
     # sort hosts by number of active vms (ascending)
     hosts = sorted(hostdlist, key=lambda i: int(hostdlist[i]))
     for host in hosts:
-        print(host + ": " + str(hostdlist[host]) )
-        log.debug("switching " + host + " into maintenance mode initiated")
-        if host_maintenance_on(host):
-            log.debug("switching " + host + " into maintenance mode completed")
-            update(host)
+        address = api.hosts.get(name = host).address
+        print(host + ": " + str(hostdlist[host]) + " active vms")
+        log.info("switching " + host + " into maintenance mode initiated")
+        if host_set_maintenance(host, True):
+            log.info("switching " + host + " into maintenance mode completed")
+            if update(host):
+                log.info(host + " waiting for host to come back online")
+                timeout = time.time() + float(_wait_timeout)
+                # CHECK PING HERE
+                while True:
+                    response = os.system("ping -c 1 -w2 " + address + " > /dev/null 2>&1")
+                    if response == 0:
+                        log.info(host + " is online (ping succeeded)")
+                        break
+                    elif time.time() > timeout:
+                        log.warning("timeout exceeded (" + _wait_timeout + " seconds)" )
+                        break
+                    else:
+                        time.sleep(1)
+                if api.hosts.get(name = host).status.state != "maintenance":
+                    log.warning("skipping " + host + " - manual intervation required")
+                    continue
+                log.info("switching " + host + " into active mode initiated")
+                if host_set_maintenance(host, False):
+                    log.info("switching " + host + " into active mode completed")
+                else:
+                    log.error("switching " + host + " into active mode failed - skipping (manual intervation required)")
+            else:
+                log.error("failed to update " + host + " (please, see log for details)")
         else:
-            log.debug("switching " + host + " into maintenance mode failed - skipping")
-        return
-    #for key, value in hostdlist.iteritems():
-    #    print(key + ": " + str(value) )
+            log.error("switching " + host + " into maintenance mode failed - skipping (manual intervation required)")
 
-def host_maintenance_on(hostname):
+        return
+
+def host_set_maintenance(hostname, set_maintenance = True):
+    # status values: 
+    # down, error, initializing, installing, install_failed, maintenance, 
+    # non_operational, non_responsive, pending_approval, preparing_for_maintenance, 
+    # connecting, reboot, unassigned and up
     host = api.hosts.get(name = hostname)
-    if host.status.state == "up":
+    # set maintenance
+    # (consider to check for "unassigned" state as well)
+    if host.status.state == "up" and set_maintenance:
         host.deactivate()
+        timeout = time.time() + float(_wait_timeout)
         while api.hosts.get(name = hostname).status.state != "maintenance":
-            # may take awhile to complete - think to implement timeout
-            time.sleep(1)
-    elif host.status.state == "maintenance":
+            if time.time() > timeout:
+                log.error("timeout exceeded (" + _wait_timeout + " seconds)" )
+                return False
+            else:
+                time.sleep(1)
+    elif host.status.state == "maintenance" and set_maintenance:
         log.debug(hostname + " is already in maintenance mode")
-    elif host.status.state == "preparing_for_maintenance":
+    elif host.status.state == "preparing_for_maintenance" and set_maintenance:
         log.debug(hostname + " is in middle of switching to maintenance mode")
+        timeout = time.time() + float(_wait_timeout)
         while api.hosts.get(name = hostname).status.state != "maintenance":
-            time.sleep(1)
+            if time.time() > timeout:
+                log.error("timeout exceeded (" + _wait_timeout + " seconds)" )
+                return False
+            else:
+                time.sleep(1)
+    elif host.status.state == "reboot" and set_maintenance:
+        timeout = time.time() + float(_wait_timeout)
+        while api.hosts.get(name = hostname).status.state != "maintenance" or api.hosts.get(name = hostname).status.state != "up":
+            if time.time() > timeout:
+                log.error("timeout exceeded (" + _wait_timeout + " seconds)" )
+                return False
+            else:
+                time.sleep(1)
+        if host.status.state == "up":
+            host.deactivate()
+            timeout = time.time() + float(_wait_timeout)
+            while api.hosts.get(name = hostname).status.state != "maintenance":
+                if time.time() > timeout:
+                    log.error("timeout exceeded (" + _wait_timeout + " seconds)" )
+                    return False
+                else:
+                    time.sleep(1)
+
+    # set active
+    elif host.status.state == "up" and not set_maintenance:
+        log.debug(hostname + " is already in active mode")
+    elif host.status.state == "maintenance" and not set_maintenance:
+        host.activate()
+        timeout = time.time() + float(_wait_timeout)
+        while api.hosts.get(name = hostname).status.state != "up":
+            if time.time() > timeout:
+                log.error("timeout exceeded (" + _wait_timeout + " seconds)" )
+                return False
+            else:
+                time.sleep(1)
+    elif host.status.state == "preparing_for_maintenance" and not set_maintenance:
+        log.debug(hostname + " is in middle of switching to maintenance mode")
+        host.activate()
+        timeout = time.time() + float(_wait_timeout)
+        while api.hosts.get(name = hostname).status.state != "up":
+            if time.time() > timeout:
+                log.error("timeout exceeded (" + _wait_timeout + " seconds)" )
+                return False
+            else:
+                time.sleep(1)
+    elif host.status.state == "reboot" and not set_maintenance:
+        timeout = time.time() + float(_wait_timeout)
+        while api.hosts.get(name = hostname).status.state != "maintenance" or api.hosts.get(name = hostname).status.state != "up":
+            if time.time() > timeout:
+                log.error("timeout exceeded (" + _wait_timeout + " seconds)" )
+                return False
+            else:
+                time.sleep(1)
+        if host.status.state == "maintenance":
+            host.activate()
+            timeout = time.time() + float(_wait_timeout)
+            while api.hosts.get(name = hostname).status.state != "up":
+                if time.time() > timeout:
+                    log.error("timeout exceeded (" + _wait_timeout + " seconds)" )
+                    return False
+                else:
+                    time.sleep(1)
+
+    # failure
     else:
-        log.debug(hostname + " is in invalide state: " + host.status.state)
+        log.error(hostname + " is in invalide state: " + host.status.state)
         return False
     return True
 
 def update(hostname):
+    host    = api.hosts.get(name = hostname)
     address = api.hosts.get(name = hostname).address
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    #log.getLogger("paramiko").setLevel(logging.WARNING)
     try:
         try:
-            log.debug("connecting to " + address + " via ssh");
-            ssh.connect(address, username=_host_user, password=_host_pass, timeout=10)
+            log.info("connecting to " + address + " via ssh");
+            ssh.connect(address, username=_host_user, password=_host_pass, timeout=_ssh_timeout)
 
             # yum clean all
             stdin, stdout, stderr = ssh.exec_command("yum clean all")
             stdin.close()
             retcode = stdout.channel.recv_exit_status()
             if retcode == 0:
-                log.debug(hostname + ": cleaning yum cache succeded")
+                log.info(hostname + ": cleaning yum cache succeeded")
             else:
-                log.debug(hostname + ": cleaning yum cache failed")
+                log.error(hostname + ": cleaning yum cache failed")
 
             # yum check-update
             stdin, stdout, stderr = ssh.exec_command("yum check-update")
@@ -105,42 +211,50 @@ def update(hostname):
             retcode = stdout.channel.recv_exit_status()
             ## 100 - there are available packages
             if retcode == 100:
-                log.debug(hostname + ": updates are available")
+                log.info(hostname + ": updates are available")
             ## 0 - no available updates
             elif retcode == 0:
-                log.debug(hostname + ": no updates found - skipping")
+                log.info(hostname + ": no updates found - skipping")
                 return False
             ## 1 - error
             elif retcode == 1:
-                log.debug(hostname + ": [error] checking for updates failed on ")
+                log.error(hostname + ": [error] checking for updates failed on ")
                 for line in stderr.read().splitlines():
-                    log.debug(hostname + " [error]: " + line)
+                    log.error(hostname + " [error]: " + line)
                 return False
             ## unknown 
             else:
-                log.debug(hostname + ": unknown output while checking for updates - skipping")
+                log.error(hostname + ": unknown output while checking for updates - skipping")
                 return False
 
             # yum update
-            log.debug(hostname + ": yum update initiated")
-            stdin, stdout, stderr = ssh.exec_command("yum update -y")
+            log.info(hostname + ": yum update initiated")
+            # stdin, stdout, stderr = ssh.exec_command("yum update -y")     #<--------- UNCOMMENT LATER
+            stdin, stdout, stderr = ssh.exec_command("yum update gnutls -y")
             stdin.close()
             retcode = stdout.channel.recv_exit_status()
             for line in stdout.read().splitlines():
                 log.debug(hostname + ": " + line)
             if retcode != 0:
-                log.debug(hostname + ": yum update failed [exit code: " + str(retcode) + "]")
+                log.error(hostname + ": yum update failed [exit code: " + str(retcode) + "]")
                 for line in stderr.read().splitlines():
-                    log.debug(hostname + " [error]: " + line)
-            else:
-                log.debug(hostname + ": yum update completed successfully ")
-
-            # reboot
+                    log.error(hostname + " [error]: " + line)
+                return False
+            # on success - reboot
+            log.info(hostname + ": yum update completed successfully ")
+            stdin, stdout, stderr = ssh.exec_command("/sbin/reboot -f > /dev/null 2>&1 &")
+            stdin.close()
+            retcode = stdout.channel.recv_exit_status()
+            if retcode != 0:
+                log.error(hostname + ": failed to reboot [exit code: " + str(retcode) + "]")
+                return False
+            log.info(hostname + ": reboot successfully initiated ")
+            return True
         except socket.error, (errnum, errmsg):
-            log.debug("failed to connect: " + errmsg + " [" + errnum + "]")
+            log.error("failed to connect: " + errmsg + " [" + errnum + "]")
             sys.exit(10)
         except paramiko.AuthenticationException:
-            log.debug("failed to connect: authentication failed")
+            log.error("failed to connect: authentication failed")
             sys.exit(11)
     finally:
         ssh.close()
@@ -150,13 +264,21 @@ def update(hostname):
 ###########################################################################################
 
 # logging (INFO/DEBUG)
-log.basicConfig(level=log.DEBUG,
-                format   =  '%(asctime)s %(levelname)-8s %(message)s',
-                datefmt  =  '%d %b %Y %H:%M:%S',
-                filename =  _base_filename + ".log",
-                filemode =  'a')
+if _loglevel.lower() == "debug":
+    log.getLogger().setLevel(log.DEBUG)
+elif _loglevel.lower() == "error":
+    log.getLogger().setLevel(log.ERROR)
+elif _loglevel.lower() == "warning":
+    log.getLogger().setLevel(log.WARNING)
+else:
+    log.getLogger().setLevel(log.INFO)
 
-log.debug("initializing")
+log.basicConfig(format   = '%(asctime)s %(levelname)-8s %(message)s',
+                datefmt  = '%d %b %Y %H:%M:%S',
+                filename = _base_filename + ".log",
+                filemode = 'a')
+
+log.info("initializing")
 
 # parse configuration file
 log.debug("parsing configuration file " + _base_filename + ".conf");
@@ -164,6 +286,12 @@ config = ConfigParser.ConfigParser()
 fs = config.read(_base_filename + ".conf")
 if len(fs) != 0:
     for section in config.sections():
+        if string.lower(section) == 'general':
+            for var in config.options(section):
+                if var == 'wait_timeout':
+                    _wait_timeout = config.get(section, var)
+                elif var == 'loglevel':
+                    _loglevel = config.get(section, var)
         if string.lower(section) == 'engine':
             for var in config.options(section):
                 if var == 'hostname':
@@ -182,7 +310,8 @@ if len(fs) != 0:
                 elif var == 'password':
                     _host_pass = config.get(section, var)
                     _host_pass = base64.b64decode(_host_pass);
-
+                elif var == 'ssh_timeout':
+                    _ssh_timeout = config.get(section, var)
 
 # command line args
 log.debug("parsing command line arguments");
@@ -241,9 +370,9 @@ if not _engine_cacert or os.path.exists(_engine_cacert) is False:
     try:
         response = urllib2.urlopen(_ca_url)
     except HTTPError as e:
-        log.debug("server couldn\'t fulfill the request (error code: " +  e.code + ")")
+        log.error("server couldn\'t fulfill the request (error code: " +  e.code + ")")
     except URLError as e:
-        log.debug("failed to reach server: " +  e.reason )
+        log.error("failed to reach server: " +  e.reason )
     else:
         with open(_ca_name, "wb") as code:
             code.write(response.read())
@@ -251,18 +380,18 @@ if not _engine_cacert or os.path.exists(_engine_cacert) is False:
 
 if os.path.exists(_engine_cacert) is False:
     print("CA certificate is not available or not valid - unable to proceed (see log for details) ")
-    log.debug("CA certificate " + _engine_cacert + " is not available or not valid - unable to proceed")
+    log.error("CA certificate " + _engine_cacert + " is not available or not valid - unable to proceed")
     sys.exit(2)
 else:
-    log.debug("CA certificate acquired: " + _engine_cacert)
+    log.info("CA certificate acquired: " + _engine_cacert)
 
 # connect to engine
 _api_url = "https://" + _engine_addr + "/api"
 try:
     api = API(url = _api_url, username = _engine_user, password = _engine_pass, ca_file = _engine_cacert)
-    log.debug("connection established with rhevm api: " + _api_url)
+    log.info("connection established with rhevm api: " + _api_url)
 except Exception as e:
-    log.debug(str(e))
+    log.error(str(e))
     sys.exit(3)
 
 try:
@@ -338,19 +467,21 @@ try:
                 for host in hosts:
                     #print(" %15s: %20s  %15s  %10s  %40s  %25s  %25s" % ("host", host.name, host.status.state, host.summary.active, host.os.get_type() + " " + host.os.version.get_full_version(), host.version.get_full_version(), host.libvirt_version.get_full_version()) )
                     # perhaps, check type for (rhev-h or rhel)
-                    #if host.status.state.lower() == "up":
-                    hosts2update[host.name] = host.summary.active
+
+                    # add only active hosts
+                    if host.status.state == "up":
+                        hosts2update[host.name] = host.summary.active
                 print
             host_bulkupdate(**hosts2update)
 
 except Exception as e:
-    log.debug("[error]: [line " + format(sys.exc_info()[-1].tb_lineno) + "] " + str(e) )
+    log.error("[error]: [line " + format(sys.exc_info()[-1].tb_lineno) + "] " + str(e) )
     sys.exit(4)
 finally:
     api.disconnect()
-    log.debug("connection closed")
+    log.info("connection closed")
 
 # finish
-log.debug("end reached - exiting")
+log.info("end reached - exiting")
 
 sys.exit(0)
