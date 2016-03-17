@@ -55,10 +55,28 @@ _datacenters    = []
 # Functions
 ############################################################################################
 
+# todo:
+# - if total 2 hosts and 1 failed to update & set active - stop update process
+# - check for updates prior to switching host into maintenance mode
+# - recover/activate host if update failed
+# - count failers and stop if too many [done]
 def host_bulkupdate(**hostdlist):
     # sort hosts by number of active vms (ascending)
     hosts = sorted(hostdlist, key=lambda i: int(hostdlist[i]))
+    count = 0
     for host in hosts:
+        if count > 2:
+            print("Multiple failers encountered: " + str(count) )
+            while True:
+                userinput = raw_input(' Proceed (y/n): ')
+                userinput = userinput.strip().lower()
+                if userinput not in ["y","n"]:
+                    continue
+                elif userinput == "n":
+                    print(" Action canceled - exiting")
+                    sys.exit(0)
+                else:
+                    break
         address = api.hosts.get(name = host).address
         print(host + ": " + str(hostdlist[host]) + " active vms")
         log.info("switching " + host + " into maintenance mode initiated")
@@ -67,31 +85,43 @@ def host_bulkupdate(**hostdlist):
             if update(host):
                 log.info(host + " waiting for host to come back online")
                 timeout = time.time() + float(_wait_timeout)
-                # CHECK PING HERE
+                # sleep for 10 seconds before pinging
+                time.sleep(10)
                 while True:
                     response = os.system("ping -c 1 -w2 " + address + " > /dev/null 2>&1")
                     if response == 0:
                         log.info(host + " is online (ping succeeded)")
                         break
                     elif time.time() > timeout:
+                        count += 1
                         log.warning("timeout exceeded (" + _wait_timeout + " seconds)" )
                         break
                     else:
                         time.sleep(1)
                 if api.hosts.get(name = host).status.state != "maintenance":
                     log.warning("skipping " + host + " - manual intervation required")
+                    count += 1
                     continue
                 log.info("switching " + host + " into active mode initiated")
                 if host_set_maintenance(host, False):
                     log.info("switching " + host + " into active mode completed")
                 else:
                     log.error("switching " + host + " into active mode failed - skipping (manual intervation required)")
+                    count += 1
             else:
-                log.error("failed to update " + host + " (please, see log for details)")
+                log.error("failed to update " + host)
+                count += 1
+                # todo: host still in maintenance mode - bring it back
+                log.info("switching " + host + " into active mode initiated")
+                if host_set_maintenance(host, False):
+                    log.info("switching " + host + " into active mode completed")
+                else:
+                    log.error("switching " + host + " into active mode failed - skipping (manual intervation required)")
+                    count += 1
         else:
             log.error("switching " + host + " into maintenance mode failed - skipping (manual intervation required)")
-
-        return
+            count += 1
+    return
 
 def host_set_maintenance(hostname, set_maintenance = True):
     # status values: 
@@ -190,7 +220,6 @@ def update(hostname):
     address = api.hosts.get(name = hostname).address
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    #log.getLogger("paramiko").setLevel(logging.WARNING)
     try:
         try:
             log.info("connecting to " + address + " via ssh");
@@ -215,6 +244,7 @@ def update(hostname):
             ## 0 - no available updates
             elif retcode == 0:
                 log.info(hostname + ": no updates found - skipping")
+                # should it be False?
                 return False
             ## 1 - error
             elif retcode == 1:
@@ -229,8 +259,8 @@ def update(hostname):
 
             # yum update
             log.info(hostname + ": yum update initiated")
-            # stdin, stdout, stderr = ssh.exec_command("yum update -y")     #<--------- UNCOMMENT LATER
-            stdin, stdout, stderr = ssh.exec_command("yum update gnutls -y")
+            stdin, stdout, stderr = ssh.exec_command("yum update -y")
+            #stdin, stdout, stderr = ssh.exec_command("yum update gnutls -y")
             stdin.close()
             retcode = stdout.channel.recv_exit_status()
             for line in stdout.read().splitlines():
@@ -261,19 +291,11 @@ def update(hostname):
 
 ############################################################################################
 # Main
-###########################################################################################
+############################################################################################
 
-# logging (INFO/DEBUG)
-if _loglevel.lower() == "debug":
-    log.getLogger().setLevel(log.DEBUG)
-elif _loglevel.lower() == "error":
-    log.getLogger().setLevel(log.ERROR)
-elif _loglevel.lower() == "warning":
-    log.getLogger().setLevel(log.WARNING)
-else:
-    log.getLogger().setLevel(log.INFO)
-
-log.basicConfig(format   = '%(asctime)s %(levelname)-8s %(message)s',
+# logging format
+log.basicConfig(level    = log.INFO,
+                format   = '%(asctime)s %(levelname)-8s %(message)s',
                 datefmt  = '%d %b %Y %H:%M:%S',
                 filename = _base_filename + ".log",
                 filemode = 'a')
@@ -313,21 +335,35 @@ if len(fs) != 0:
                 elif var == 'ssh_timeout':
                     _ssh_timeout = config.get(section, var)
 
+# change logging level
+if _loglevel.lower() == "debug":
+    log.getLogger().setLevel(log.DEBUG)
+elif _loglevel.lower() == "error":
+    log.getLogger().setLevel(log.ERROR)
+elif _loglevel.lower() == "warning":
+    log.getLogger().setLevel(log.WARNING)
+else:
+    log.getLogger().setLevel(log.INFO)
+
 # command line args
 log.debug("parsing command line arguments");
-parser = argparse.ArgumentParser(description="Update RHEV hypervisor/s", epilog="Example: %(prog)s -e x.y.z.w -u root -p secret host1 host2...")
+parser = argparse.ArgumentParser(description="Update RHEV hypervisor/s", epilog="Example: %(prog)s -e engine-address -u username -p password")
+#parser = argparse.ArgumentParser(description="Update RHEV hypervisor/s", epilog="Example: %(prog)s -e engine-address -u username -p password -s host1 host2...")
 parser.add_argument("-l", "--list", action="store_const", const=0, dest="action", help="list datacenter/cluster/host with status")
-parser.add_argument("-U", "--update", action="store_const", const=1, dest="action", help="update datacenter/cluster/host")
-parser.add_argument("-f", "--file", type=file, help="file with hosts to update")
+parser.add_argument("-U", "--update", action="store_const", const=1, dest="action", help="initiate hypervisor update")
+#parser.add_argument("-f", "--file", type=file, help="file with hosts to update")
 parser.add_argument("-c", "--cacert", type=file, help="path to CA certificate")
-parser.add_argument("-d", "--datacenter", help="datacenter name")
 parser.add_argument("-e", "--engine", help="rhev engine address")
 parser.add_argument("-u", "--username", help="rhev engine username (yum run privileges)")
 parser.add_argument("-p", "--password", help="rhev engine password")
-parser.add_argument("-s", "--hypervisor", nargs='+', help="hypervisor/s to apply updates to")
+#parser.add_argument("-s", "--hypervisor", nargs='+', help="hypervisor/s to apply updates to")
+#parser.add_argument('-d', "--datacenter", nargs = '*', help = 'datacenter1 datacenter2 ...', dest="datacenter", default = argparse.SUPPRESS)
+#parser.add_argument("-d", "--datacenter", help="datacenter name")
 parser.add_argument('--version', action='version', version=str(_version))
-parser.add_argument("-v", "--verbose", action="store_true")
+#parser.add_argument("-v", "--verbose", action="store_true")
 args = parser.parse_args()
+
+#print(args)
 
 _action = args.action
 if not _action:
@@ -405,8 +441,6 @@ try:
             for cluster in datacenter.clusters.list():
                 print(" %15s: %20s" % ("cluster", cluster.name) )
                 hosts = api.hosts.list(query = 'cluster=' + cluster.name)
-                #hosts = api.hosts.get( id=api.vms.get(obj.name).get_host().get_id() ).get_name()
-                #cluster.get_href()
                 for host in hosts:
                     print(" %15s: %20s  %15s  %10s  %40s  %25s  %25s" % ("host", host.name, host.status.state, host.summary.active, host.os.get_type() + " " + host.os.version.get_full_version(), host.version.get_full_version(), host.libvirt_version.get_full_version()) )
             print("")
@@ -465,11 +499,8 @@ try:
                 print(" %15s: %20s" % ("cluster", cluster.name) )
                 hosts = api.hosts.list(query = 'cluster=' + cluster.name)
                 for host in hosts:
-                    #print(" %15s: %20s  %15s  %10s  %40s  %25s  %25s" % ("host", host.name, host.status.state, host.summary.active, host.os.get_type() + " " + host.os.version.get_full_version(), host.version.get_full_version(), host.libvirt_version.get_full_version()) )
-                    # perhaps, check type for (rhev-h or rhel)
-
-                    # add only active hosts
-                    if host.status.state == "up":
+                    # add only rhel-h active hosts
+                    if host.status.state == "up" and host.os.get_type().lower() == "rhel":
                         hosts2update[host.name] = host.summary.active
                 print
             host_bulkupdate(**hosts2update)
@@ -481,7 +512,12 @@ finally:
     api.disconnect()
     log.info("connection closed")
 
-# finish
+###########################################################################################
+# Post
+###########################################################################################
 log.info("end reached - exiting")
 
 sys.exit(0)
+###########################################################################################
+# END
+###########################################################################################
