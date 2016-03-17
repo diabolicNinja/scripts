@@ -57,9 +57,6 @@ _datacenters    = []
 
 # todo:
 # - if total 2 hosts and 1 failed to update & set active - stop update process
-# - check for updates prior to switching host into maintenance mode
-# - recover/activate host if update failed
-# - count failers and stop if too many [done]
 def host_bulkupdate(**hostdlist):
     # sort hosts by number of active vms (ascending)
     hosts = sorted(hostdlist, key=lambda i: int(hostdlist[i]))
@@ -78,7 +75,13 @@ def host_bulkupdate(**hostdlist):
                 else:
                     break
         address = api.hosts.get(name = host).address
-        print(host + ": " + str(hostdlist[host]) + " active vms")
+        print(" " + host + ": " + str(hostdlist[host]) + " active vms"),
+
+        if not check_for_update(host):
+            print(", no updates available")
+            continue
+        else:
+            print(", updates available")
         log.info("switching " + host + " into maintenance mode initiated")
         if host_set_maintenance(host, True):
             log.info("switching " + host + " into maintenance mode completed")
@@ -111,7 +114,6 @@ def host_bulkupdate(**hostdlist):
             else:
                 log.error("failed to update " + host)
                 count += 1
-                # todo: host still in maintenance mode - bring it back
                 log.info("switching " + host + " into active mode initiated")
                 if host_set_maintenance(host, False):
                     log.info("switching " + host + " into active mode completed")
@@ -208,14 +210,13 @@ def host_set_maintenance(hostname, set_maintenance = True):
                     return False
                 else:
                     time.sleep(1)
-
     # failure
     else:
         log.error(hostname + " is in invalide state: " + host.status.state)
         return False
     return True
 
-def update(hostname):
+def check_for_update(hostname):
     host    = api.hosts.get(name = hostname)
     address = api.hosts.get(name = hostname).address
     ssh = paramiko.SSHClient()
@@ -244,7 +245,6 @@ def update(hostname):
             ## 0 - no available updates
             elif retcode == 0:
                 log.info(hostname + ": no updates found - skipping")
-                # should it be False?
                 return False
             ## 1 - error
             elif retcode == 1:
@@ -252,15 +252,32 @@ def update(hostname):
                 for line in stderr.read().splitlines():
                     log.error(hostname + " [error]: " + line)
                 return False
-            ## unknown 
+            ## unknown
             else:
                 log.error(hostname + ": unknown output while checking for updates - skipping")
                 return False
+        except socket.error, (errnum, errmsg):
+            log.error("failed to connect: " + errmsg + " [" + errnum + "]")
+            return False
+        except paramiko.AuthenticationException:
+            log.error("failed to connect: authentication failed")
+            return False
+    finally:
+        ssh.close()
+    return True
 
+def update(hostname):
+    host    = api.hosts.get(name = hostname)
+    address = api.hosts.get(name = hostname).address
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        try:
+            log.info("connecting to " + address + " via ssh");
+            ssh.connect(address, username=_host_user, password=_host_pass, timeout=_ssh_timeout)
             # yum update
             log.info(hostname + ": yum update initiated")
             stdin, stdout, stderr = ssh.exec_command("yum update -y")
-            #stdin, stdout, stderr = ssh.exec_command("yum update gnutls -y")
             stdin.close()
             retcode = stdout.channel.recv_exit_status()
             for line in stdout.read().splitlines():
@@ -515,7 +532,7 @@ finally:
 ###########################################################################################
 # Post
 ###########################################################################################
-log.info("end reached - exiting")
+log.info("process completed")
 
 sys.exit(0)
 ###########################################################################################
