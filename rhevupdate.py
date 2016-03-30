@@ -57,39 +57,31 @@ _datacenters    = []
 
 # todo:
 # - if total 2 hosts and 1 failed to update & set active - stop update process
+# - what todo if only 1 host in cluster ?
 def host_bulkupdate(**hostdlist):
     # sort hosts by number of active vms (ascending)
     hosts = sorted(hostdlist, key=lambda i: int(hostdlist[i]))
     count = 0
     for host in hosts:
         if count > 2:
-            print("Multiple failers encountered: " + str(count) )
-            while True:
-                userinput = raw_input(' Proceed (y/n): ')
-                userinput = userinput.strip().lower()
-                if userinput not in ["y","n"]:
-                    continue
-                elif userinput == "n":
-                    print(" Action canceled - exiting")
-                    sys.exit(0)
-                else:
-                    break
+            print(" *** multiple failers encountered: " + str(count) )
+            confirm("Proceed")
         address = api.hosts.get(name = host).address
-        print(" " + host + ": " + str(hostdlist[host]) + " active vms"),
+        print(" %15s: %20s %20s active vms" % ("host", host, str(hostdlist[host]) ) ),
 
         if not check_for_update(host):
-            print(", no updates available")
+            print("(no updates available)")
             continue
         else:
-            print(", updates available")
+            print("(updates are available)")
         log.info("switching " + host + " into maintenance mode initiated")
         if host_set_maintenance(host, True):
             log.info("switching " + host + " into maintenance mode completed")
             if update(host):
                 log.info(host + " waiting for host to come back online")
                 timeout = time.time() + float(_wait_timeout)
-                # sleep for 10 seconds before pinging
-                time.sleep(10)
+                # sleep for 60 seconds before pinging
+                time.sleep(60)
                 while True:
                     response = os.system("ping -c 1 -w2 " + address + " > /dev/null 2>&1")
                     if response == 0:
@@ -289,7 +281,8 @@ def update(hostname):
                 return False
             # on success - reboot
             log.info(hostname + ": yum update completed successfully ")
-            stdin, stdout, stderr = ssh.exec_command("/sbin/reboot -f > /dev/null 2>&1 &")
+            #stdin, stdout, stderr = ssh.exec_command("/sbin/reboot -f > /dev/null 2>&1 &")
+            stdin, stdout, stderr = ssh.exec_command("shutdown -r now > /dev/null 2>&1 &")
             stdin.close()
             retcode = stdout.channel.recv_exit_status()
             if retcode != 0:
@@ -305,6 +298,20 @@ def update(hostname):
             sys.exit(11)
     finally:
         ssh.close()
+
+
+def confirm(message):
+    while True:
+        userinput = raw_input(' ' + message + ' (y/n): ')
+        userinput = userinput.strip().lower()
+        if userinput not in ["y","n"]:
+            continue
+        elif userinput == "n":
+            print(" Action canceled - exiting")
+            sys.exit(0)
+        else:
+            break
+    return
 
 ############################################################################################
 # Main
@@ -493,34 +500,32 @@ try:
         print(" Selected:")
         for dc in _datacenters:
             print(" - " + dc)
-        while True:
-            userinput = raw_input(' Proceed (y/n): ')
-            userinput = userinput.strip().lower()
-            if userinput not in ["y","n"]:
-                continue
-            elif userinput == "n":
-                print(" Action canceled - exiting")
-                sys.exit(0)
-            else:
-                # finally starting updates
-                break
-
+        confirm("Proceed with updates?")
         # update itself
         print
-        for datacenter in _datacenters:
-            print(" Updating " + datacenter + ":")
-            datacenter = api.datacenters.get(datacenter)
+        for dc in _datacenters:
+            datacenter = api.datacenters.get(dc)
+            print(" %15s: %20s" % ("datacenter", dc))
             print(" %15s: %20s" % ("status", datacenter.status.state ))
+            print
             for cluster in datacenter.clusters.list():
                 hosts2update = {}
                 print(" %15s: %20s" % ("cluster", cluster.name) )
                 hosts = api.hosts.list(query = 'cluster=' + cluster.name)
+                available_hosts = len(hosts)
+                if available_hosts < 2:
+                    print(" %15s: %20s %20s" % ("action", "skipping", "only " + str(available_hosts) + " available hosts found" ) )
+                    print
+                    continue
+                else:
+                    print(" %15s: %20s" % ("action", "updating") )
                 for host in hosts:
                     # add only rhel-h active hosts
                     if host.status.state == "up" and host.os.get_type().lower() == "rhel":
                         hosts2update[host.name] = host.summary.active
+                # update one cluster at a time
+                host_bulkupdate(**hosts2update)
                 print
-            host_bulkupdate(**hosts2update)
 
 except Exception as e:
     log.error("[error]: [line " + format(sys.exc_info()[-1].tb_lineno) + "] " + str(e) )
